@@ -542,6 +542,15 @@ def spawn_in_new_window(claude_cmd):
             return True
         except Exception:
             pass
+    if (os.environ.get("TERM_PROGRAM") == "ghostty" or os.environ.get("GHOSTTY_RESOURCES_DIR")) and sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["open", "-na", "Ghostty.app", "--args", "-e", "sh", "-c", claude_cmd],
+                check=True
+            )
+            return True
+        except Exception:
+            pass
     if sys.platform == "darwin":
         is_iterm = (
             os.environ.get("LC_TERMINAL") == "iTerm2"
