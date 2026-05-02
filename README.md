@@ -147,4 +147,4 @@ Built by **RSLA**. [RajSinghLA.com](https://rajsinghla.com).
 
 Made this because my Claude Code project folder got too big to navigate and I wanted one keyword to drop me back into the right context. If you're hitting the same wall, it should help.
 
-PRs welcome. Stars are free, and they help.
+PRs welcome.
