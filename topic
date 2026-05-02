@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+# topic — Claude Code topic-based session launcher
+# Author: RSLA (https://rajsinghla.com)
+# License: MIT
+"""topic — Claude Code topic-based session launcher.
+
+Reads MEMORY.md for curated topic clusters AND mines session JSONLs for
+ad-hoc topics. Sorts by most-recent activity. Always auto-refreshes — index
+is rebuilt from changed JSONLs on every invocation (fast, mtime-based).
+
+  topic                     picker sorted by recency → resume
+  topic <name>              substring or entity match → resume
+                            (e.g. `topic alex` finds sessions where Alex was
+                             mentioned >=3 times, even if not in the title)
+  topic new                 interactive: create a new MEMORY.md cluster
+  topic list                print topic tree with activity metrics
+  topic dashboard           regenerate Dashboard.md (Obsidian MOC)
+  topic graph               regen + open Obsidian on Dashboard
+  topic --dry <name>        preview launch prompt without launching
+
+Hidden: `topic rescan` force-clears cache (rarely needed; auto-refresh on
+every run picks up new/changed sessions already).
+
+Configuration via environment variables:
+  TOPIC_PROJECT       Claude Code project name to target. Defaults to your
+                      home directory's project (e.g. "-Users-jane" if your
+                      home is "/Users/jane"). Override if you want `topic`
+                      to operate on a different project's memory + sessions.
+  TOPIC_CLAUDE_BIN    Path to the `claude` CLI. Defaults to `which claude`,
+                      then ~/.local/bin/claude as a fallback.
+  TOPIC_STOP_NAMES    Comma-separated extra names to filter out of entity
+                      extraction (your name, your company, recurring noise).
+                      Example: TOPIC_STOP_NAMES="Jane,Acme,Loompa".
+"""
+import os, re, sys, json, subprocess, shutil, time, hashlib
+from pathlib import Path
+from datetime import datetime, timezone
+
+HOME = Path.home()
+HOME_PROJECT_NAME = str(HOME).replace("/", "-")
+PROJECT_NAME = os.environ.get("TOPIC_PROJECT", HOME_PROJECT_NAME)
+PROJECT_BASE = HOME / ".claude" / "projects" / PROJECT_NAME
+MEM = PROJECT_BASE / "memory"
+INDEX = MEM / "MEMORY.md"
+DASHBOARD = MEM / "Dashboard.md"
+SESSIONS_DIR = PROJECT_BASE
+CLAUDE_BIN = (
+    os.environ.get("TOPIC_CLAUDE_BIN")
+    or shutil.which("claude")
+    or str(HOME / ".local" / "bin" / "claude")
+)
+CACHE_DIR = HOME / ".cache" / "topic"
+CACHE = CACHE_DIR / "sessions.json"
+
+EXTRA_STOP_NAMES = {
+    s.strip() for s in os.environ.get("TOPIC_STOP_NAMES", "").split(",") if s.strip()
+}
+
+STOP = set("the a an of and for in on to by with about into over from as is are be it this that".split())
+
+# ---------- parsing MEMORY.md clusters ----------
+
+def parse_clusters():
+    topics = []
+    cur = None
+    for raw in INDEX.read_text().splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", raw)
+        if m:
+            if cur:
+                topics.append(cur)
+            cur = {"heading": m.group(1).strip(), "lines": [], "files": []}
+            continue
+        if cur is None:
+            continue
+        cur["lines"].append(raw)
+        for f in re.findall(r"\]\(([^)]+\.md)\)", raw):
+            if not f.startswith("http") and "/" not in f:
+                cur["files"].append(f)
+    if cur:
+        topics.append(cur)
+    for t in topics:
+        t["files"] = list(dict.fromkeys(t["files"]))
+        t["keywords"] = cluster_keywords(t)
+    return topics
+
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")[:40]
+
+def short_token(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def cluster_keywords(cluster):
+    """Distinctive words for matching sessions to this cluster."""
+    words = set()
+    # heading words
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", cluster["heading"]):
+        lw = w.lower()
+        if len(lw) >= 3 and lw not in STOP:
+            words.add(lw)
+    # filename stems, stripped of type prefix
+    for f in cluster["files"]:
+        stem = Path(f).stem
+        stem = re.sub(r"^(project|feedback|reference|user)_", "", stem)
+        for part in stem.split("_"):
+            if len(part) >= 3 and part not in STOP:
+                words.add(part.lower())
+    return words
+
+# ---------- session index ----------
+
+def load_cache():
+    if not CACHE.exists():
+        return {}
+    try:
+        return json.loads(CACHE.read_text())
+    except Exception:
+        return {}
+
+def save_cache(data):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(data))
+
+def is_junk_title(s):
+    """Skip messages that are clearly pastes/noise, not a topic statement."""
+    if not s or len(s) < 3: return True
+    if s.startswith(("<", "{", "[", "This session is being continued", "<command-", "/", "http")):
+        if s.startswith(("<", "{", "[")): return True
+    # too many non-alpha chars (HTML/code/table paste)
+    alnum = sum(1 for c in s if c.isalnum() or c.isspace())
+    if alnum / max(len(s), 1) < 0.65: return True
+    # repeated structural tokens (table rows, navigation)
+    if re.search(r"(\n\s*){4,}", s): return True
+    # noisy keywords that suggest a paste
+    noise = ("Skip to content", "Search The ", "You have \\d+ new", "Inserted suggestion")
+    for n in noise:
+        if re.search(n, s): return True
+    # very first line shouldn't be entirely numbers / nav elements
+    first = s.split("\n", 1)[0].strip()
+    if first and sum(c.isdigit() for c in first) / max(len(first), 1) > 0.5: return True
+    return False
+
+def clean_title(s):
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if is_junk_title(s):
+        return ""
+    first = s.split("\n", 1)[0].strip()
+    return first[:120] if first else ""
+
+def find_topic_from_msgs(msgs):
+    """Walk user messages in order; return first non-junk one as the title.
+    If all are junk, pick the most distinctive proper-noun phrase across them."""
+    for m in msgs:
+        ct = clean_title(m)
+        if ct:
+            return ct
+    # fallback: extract a distinctive capitalized phrase across all messages
+    blob = " ".join(msgs[:10])
+    # find capitalized word or phrase (e.g. "Alice", "Bob")
+    cand = re.findall(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b", blob)
+    from collections import Counter
+    common_stop = {"The", "This", "That", "When", "Then", "Inserted", "Using",
+                   "You", "Slack", "Search", "New", "Home", "Messages", "From"}
+    counts = Counter(c for c in cand if c not in common_stop)
+    if counts:
+        top = counts.most_common(1)[0][0]
+        return f"re: {top}"
+    return "(untitled)"
+
+def scan_session(path):
+    """Return stats for one JSONL session file."""
+    stat = path.stat()
+    msg_count = 0
+    total_chars = 0
+    last_ts = None
+    user_msgs = []
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                if t == "user":
+                    msg_count += 1
+                    m = d.get("message", {}).get("content", "")
+                    if isinstance(m, str):
+                        total_chars += len(m)
+                        if len(user_msgs) < 20:  # keep first 20 user msgs for title/keyword work
+                            user_msgs.append(m[:3000])
+                elif t == "assistant":
+                    m = d.get("message", {}).get("content", [])
+                    if isinstance(m, list):
+                        for c in m:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                total_chars += len(c.get("text", ""))
+                ts = d.get("timestamp")
+                if ts:
+                    last_ts = ts
+    except Exception:
+        return None
+    title = find_topic_from_msgs(user_msgs)
+    kw_src = "\n".join(um[:2000].lower() for um in user_msgs[:5])
+    entities = extract_entities(user_msgs)
+    return {
+        "id": path.stem,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "title": title,
+        "msgs": msg_count,
+        "chars": total_chars,
+        "last": last_ts,
+        "kw_src": kw_src,
+        "entities": entities,
+    }
+
+def extract_entities(user_msgs):
+    """Return list of (entity, count) for proper-noun names mentioned ≥3 times.
+    Lets `topic alex` find sessions where Alex was a major topic even if the
+    first user message was a paste."""
+    from collections import Counter
+    blob = " ".join(user_msgs[:30])
+    # capitalized tokens, single words
+    cand = re.findall(r"(?<![\w/])([A-Z][a-z]{2,20})(?!\w)", blob)
+    stop = {"The", "This", "That", "When", "Then", "There", "These", "Those",
+            "Inserted", "Using", "From", "With", "Into", "Your", "You",
+            "Slack", "Search", "New", "Home", "Messages", "Skip", "Section",
+            "Content", "Today", "Yesterday", "Tomorrow", "Monday", "Tuesday",
+            "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "January",
+            "February", "March", "April", "May", "June", "July", "August",
+            "September", "October", "November", "December",
+            "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept",
+            "Oct", "Nov", "Dec", "Pacific", "Eastern", "Central", "Mountain",
+            "Claude", "Code", "Untitled", "User",
+            "Assistant", "Tool", "Agent", "System", "Users", "Actives",
+            "CanvasListFolder", "Huddle", "External", "Error", "Profile",
+            "View", "Build", "Monitor", "Chrome", "Safari", "Firefox",
+            "Gmail", "Google", "Apple", "Mac", "Mail", "Drive", "Sheet",
+            "HTTP", "HTTPS", "JSON", "HTML", "CSS", "API", "SDK", "MCP",
+            "Please", "Thanks", "Sure", "Yes", "Yeah", "Hey", "Hi",
+            "And", "But", "Not", "Also", "For", "Now", "Here", "What"}
+    stop |= EXTRA_STOP_NAMES
+    counts = Counter(c for c in cand if c not in stop and len(c) >= 3)
+    # keep top 8 that appear ≥3 times
+    return [(e, n) for e, n in counts.most_common(8) if n >= 3]
+
+def build_session_index(force=False):
+    cache = {} if force else load_cache()
+    by_id = cache.get("sessions", {})
+    for path in SESSIONS_DIR.glob("*.jsonl"):
+        sid = path.stem
+        entry = by_id.get(sid)
+        mtime = path.stat().st_mtime
+        if entry and entry.get("mtime") == mtime:
+            continue
+        scanned = scan_session(path)
+        if scanned:
+            by_id[sid] = scanned
+    # drop entries whose files were deleted
+    existing_ids = {p.stem for p in SESSIONS_DIR.glob("*.jsonl")}
+    by_id = {k: v for k, v in by_id.items() if k in existing_ids}
+    cache["sessions"] = by_id
+    cache["built_at"] = time.time()
+    save_cache(cache)
+    return list(by_id.values())
+
+# ---------- attribution ----------
+
+def attribute_session(sess, clusters):
+    """Return cluster index with best keyword match, or None if standalone."""
+    text = (sess.get("title", "") + " " + sess.get("kw_src", "")).lower()
+    best = None
+    best_score = 2  # threshold: must have ≥2 distinct keyword hits
+    for i, c in enumerate(clusters):
+        score = 0
+        for kw in c["keywords"]:
+            if re.search(rf"\b{re.escape(kw)}\b", text):
+                score += 1
+        if score > best_score:
+            best = i
+            best_score = score
+    return best
+
+# ---------- merging rows ----------
+
+def ago(ts_iso):
+    if not ts_iso:
+        return "—"
+    try:
+        t = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+    except Exception:
+        return "—"
+    delta = datetime.now(timezone.utc) - t
+    s = int(delta.total_seconds())
+    if s < 60: return f"{s}s ago"
+    if s < 3600: return f"{s//60}m ago"
+    if s < 86400: return f"{s//3600}h ago"
+    d = s // 86400
+    if d < 7: return f"{d}d ago"
+    if d < 30: return f"{d//7}w ago"
+    return t.strftime("%Y-%m-%d")
+
+def human_chars(n):
+    if n < 1000: return f"{n}"
+    if n < 1_000_000: return f"{n/1000:.0f}K"
+    return f"{n/1_000_000:.1f}M"
+
+def iso_to_epoch(ts):
+    if not ts: return 0
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+def build_rows():
+    """Return unified list of rows sorted by most-recent activity."""
+    clusters = parse_clusters()
+    sessions = build_session_index()
+    # attribute each session
+    cluster_sessions = {i: [] for i in range(len(clusters))}
+    standalone = []
+    for s in sessions:
+        idx = attribute_session(s, clusters)
+        if idx is not None:
+            cluster_sessions[idx].append(s)
+        else:
+            standalone.append(s)
+    rows = []
+    for i, c in enumerate(clusters):
+        cs = cluster_sessions[i]
+        total_msgs = sum(s["msgs"] for s in cs)
+        total_chars = sum(s["chars"] for s in cs)
+        latest = max((s["last"] for s in cs if s.get("last")), default=None)
+        latest_id = None
+        if cs:
+            cs_sorted = sorted(cs, key=lambda s: iso_to_epoch(s.get("last")), reverse=True)
+            latest_id = cs_sorted[0]["id"]
+        rows.append({
+            "kind": "cluster",
+            "title": c["heading"],
+            "files": c["files"],
+            "msgs": total_msgs,
+            "chars": total_chars,
+            "last": latest,
+            "latest_session_id": latest_id,
+            "session_count": len(cs),
+            "cluster": c,
+        })
+    for s in standalone:
+        title = s["title"] or "(untitled)"
+        rows.append({
+            "kind": "session",
+            "title": title,
+            "files": [],
+            "msgs": s["msgs"],
+            "chars": s["chars"],
+            "last": s["last"],
+            "latest_session_id": s["id"],
+            "session_count": 1,
+            "cluster": None,
+        })
+    rows.sort(key=lambda r: iso_to_epoch(r.get("last")), reverse=True)
+    return rows
+
+# ---------- dashboard (unchanged structure, cluster-only) ----------
+
+DASHBOARD_HEADER = """---
+tags: [dashboard, moc]
+---
+
+# 🧠 Topic Dashboard
+
+*Auto-generated map of every topic cluster in this vault. Source of truth: [[MEMORY]]. Rebuild: `topic dashboard`.*
+
+> **Open graph view (⌘G in Obsidian)** to see how topics interconnect. Click any `[[link]]` to jump.
+> **Resume any topic from terminal:** `topic <keyword>` (any distinctive word). List all: `topic list`. Create new: `topic new`.
+
+"""
+
+def regen_dashboard():
+    clusters = parse_clusters()
+    out = [DASHBOARD_HEADER]
+    out.append(f"**{len(clusters)} curated clusters · {sum(len(c['files']) for c in clusters)} memory files**\n")
+    for c in clusters:
+        out.append(f"\n## {c['heading']}\n")
+        for f in c["files"]:
+            stem = Path(f).stem
+            desc = ""
+            for ln in c["lines"]:
+                if f in ln:
+                    dm = re.search(r"\]\([^)]+\)\s*[—–-]\s*(.+)$", ln)
+                    if dm:
+                        desc = " — " + dm.group(1).strip()
+                    break
+            out.append(f"- [[{stem}]]{desc}")
+        inline = [ln for ln in c["lines"]
+                  if ln.strip().startswith("-") and not re.search(r"\]\([^)]+\.md\)", ln)]
+        if inline:
+            out.append("")
+            out.extend(inline)
+    referenced = {f for c in clusters for f in c["files"]}
+    all_files = {p.name for p in MEM.glob("*.md")
+                 if p.name not in ("MEMORY.md", "Dashboard.md") and not p.name.startswith("_")}
+    orphans = sorted(all_files - referenced)
+    if orphans:
+        out.append("\n## 🧹 Unfiled (not yet in any cluster)\n")
+        out.append("*Files in the vault but not referenced in MEMORY.md. Edit MEMORY.md and run `topic dashboard` to slot them in.*\n")
+        for f in orphans:
+            out.append(f"- [[{Path(f).stem}]]")
+    DASHBOARD.write_text("\n".join(out) + "\n")
+
+# ---------- launching ----------
+
+def best_search_term(row, query=None):
+    if query:
+        return query.strip().lower()
+    heading = row["title"]
+    for w in re.findall(r"[A-Za-z0-9]+", heading):
+        lw = w.lower()
+        if len(lw) >= 3 and lw not in STOP:
+            return lw
+    return slugify(heading).split("_")[0]
+
+def build_preamble(row, query=None):
+    heading = row["title"]
+    files = row["files"]
+    search_term = best_search_term(row, query)
+    file_paths = [str(MEM / f) for f in files]
+    bullets = "\n".join(f"   - {p}" for p in file_paths) if file_paths else "   (none yet — seed the topic as you work)"
+    return f"""Resume topic: **{heading}**
+
+Before responding to my first ask, do the following:
+
+1. Read these memory files to load topic context:
+{bullets}
+
+2. Run the mem-search tool to pull recent activity from past sessions:
+   `/claude-mem:mem-search {search_term}`
+
+3. Give me a tight 3–5 line status: what this topic is, what was most recently done, and what's pending. Then ask me what I want to work on.
+"""
+
+def launch_search_history(query, dry=False):
+    """No direct topic match → launch Claude with a preamble that searches
+    full history via claude-mem, loads relevant context, then offers next steps."""
+    preamble = f"""Search topic: **{query}**
+
+The topic router didn't find a direct match in my MEMORY.md clusters or recent sessions for this term. Please:
+
+1. Run `/claude-mem:mem-search {query}` — get the result index with IDs.
+2. If anything surfaces, fetch the top 3–5 most relevant observations via `get_observations(ids=[...])` for their full narratives.
+3. Also grep for the term in my vault: `{MEM}/`, any memory file mentioning "{query}" is worth skimming.
+4. Give me a tight 3–5 line summary: what this topic has been about historically, what was most recently done on it, and what's open.
+5. Then ask me what I want to work on next.
+
+If nothing relevant turns up, say so in one line and we'll start fresh.
+"""
+    if dry:
+        print("--- launch preview (search-history fallback) ---")
+        print(preamble); print("---"); return
+    print(f"→ No direct match for '{query}' — launching Claude to search history via claude-mem...\n")
+    os.execv(CLAUDE_BIN, [CLAUDE_BIN, preamble])
+
+def launch(row, dry=False, query=None):
+    # resume path: if we have a latest session id, --resume it; else start fresh with preamble
+    sid = row.get("latest_session_id")
+    if row["kind"] == "session" and sid:
+        if dry:
+            print(f"--- launch preview (session resume) ---")
+            print(f"claude --resume {sid}")
+            print(f"title: {row['title']}")
+            print(f"---")
+            return
+        print(f"→ Resuming session: {row['title'][:80]}")
+        print(f"  ID: {sid} · {row['msgs']} msgs · {human_chars(row['chars'])} chars · last {ago(row['last'])}")
+        print("  Launching claude --resume...\n")
+        os.execv(CLAUDE_BIN, [CLAUDE_BIN, "--resume", sid])
+        return
+    # cluster: start fresh with preamble (memory-file preload + mem-search)
+    preamble = build_preamble(row, query=query)
+    if dry:
+        print("--- launch preview (cluster resume) ---")
+        print(preamble)
+        print("---")
+        return
+    print(f"→ Resuming: {row['title']}")
+    meta = []
+    if row["session_count"]:
+        meta.append(f"{row['session_count']} session{'s' if row['session_count']!=1 else ''}")
+    if row["msgs"]:
+        meta.append(f"{row['msgs']} msgs")
+        meta.append(f"{human_chars(row['chars'])} chars")
+    if row["last"]:
+        meta.append(f"last {ago(row['last'])}")
+    if meta:
+        print(f"  {' · '.join(meta)}")
+    if row["files"]:
+        print(f"  Context files: {', '.join(row['files'])}")
+    print("  Launching claude...\n")
+    os.execv(CLAUDE_BIN, [CLAUDE_BIN, preamble])
+
+# ---------- picker ----------
+
+def render_row_line(r, idx, entities_by_session=None):
+    kind_badge = "📁" if r["kind"] == "cluster" else "💬"
+    msgs = f"{r['msgs']:>4}m" if r['msgs'] else "   ·"
+    chars = f"{human_chars(r['chars']):>5}c" if r['chars'] else "    ·"
+    age = f"{ago(r['last']):>8}"
+    title = r["title"]
+    if len(title) > 58:
+        title = title[:57] + "…"
+    # pull top entities so fzf-search can find them ("alice" finds the Alice session)
+    ent_tags = ""
+    sid = r.get("latest_session_id")
+    if sid and entities_by_session and sid in entities_by_session:
+        ents = [e for e, _ in entities_by_session[sid][:4]]
+        if ents:
+            ent_tags = " · " + ", ".join(ents)
+    meta = ""
+    if r["kind"] == "cluster":
+        if r["session_count"]:
+            meta = f"  ({len(r['files'])}f · {r['session_count']}s)"
+        else:
+            meta = f"  ({len(r['files'])}f)"
+    return f"{idx}\t{kind_badge} {title}{ent_tags}\t{msgs}  {chars}  {age}{meta}"
+
+def fzf_pick(rows):
+    """Return (row, fallback_query).
+    - (row, None):        user selected a row
+    - (None, "some q"):   user hit Enter with a query that matched nothing → search-history flow
+    - (None, None):       canceled (Esc or empty)
+    """
+    if not shutil.which("fzf"):
+        print("fzf not found. Install with `brew install fzf`.")
+        sys.exit(1)
+    cache = load_cache().get("sessions", {})
+    ents_map = {sid: s.get("entities", []) for sid, s in cache.items()}
+    lines = [render_row_line(r, i, ents_map) for i, r in enumerate(rows)]
+    res = subprocess.run(
+        ["fzf", "--delimiter=\t", "--with-nth=2,3",
+         "--exact",               # literal substring only
+         "--print-query",         # always echo query (even on no match)
+         "--height=80%", "--reverse", "--border", "--ansi",
+         "--header=▸ Exact substring match · Enter on unmatched query → searches your full history via claude-mem"],
+        input="\n".join(lines), capture_output=True, text=True,
+    )
+    if res.returncode == 130:  # Esc
+        return None, None
+    out_lines = res.stdout.rstrip("\n").split("\n")
+    query = out_lines[0] if out_lines else ""
+    selected = out_lines[1] if len(out_lines) > 1 else ""
+    if selected:
+        idx = int(selected.split("\t", 1)[0])
+        return rows[idx], None
+    if query.strip():
+        return None, query.strip()
+    return None, None
+
+def fuzzy_match(rows, query, all_sessions=None):
+    q = query.lower().strip()
+    # 1. exact title
+    for r in rows:
+        if r["title"].lower() == q:
+            return r
+    # 2. word boundary match in title
+    for r in rows:
+        if re.search(rf"\b{re.escape(q)}\b", r["title"].lower()):
+            return r
+    # 3. substring in title
+    for r in rows:
+        if q in r["title"].lower():
+            return r
+    # 4. substring in cluster filenames
+    for r in rows:
+        if any(q in f.lower() for f in r["files"]):
+            return r
+    # 5. entity match across all sessions → build virtual topic row
+    if all_sessions:
+        hits = []
+        for s in all_sessions:
+            for ent, cnt in s.get("entities", []):
+                if ent.lower() == q or q in ent.lower():
+                    hits.append((s, ent, cnt))
+                    break
+        if hits:
+            hits.sort(key=lambda h: (iso_to_epoch(h[0].get("last")), h[2]), reverse=True)
+            latest_sess, ent, _ = hits[0]
+            # prefer to resume the most recent session where entity was top-mentioned
+            return {
+                "kind": "session",
+                "title": f"{ent} — {latest_sess['title'][:60]}",
+                "files": [],
+                "msgs": sum(s[0]["msgs"] for s in hits),
+                "chars": sum(s[0]["chars"] for s in hits),
+                "last": latest_sess["last"],
+                "latest_session_id": latest_sess["id"],
+                "session_count": len(hits),
+                "cluster": None,
+                "_entity_hits": hits,
+            }
+    return None
+
+# ---------- new topic ----------
+
+def ask(prompt, default=""):
+    suffix = f" [{default}]" if default else ""
+    v = input(f"{prompt}{suffix}: ").strip()
+    return v or default
+
+def cmd_new():
+    heading = ask("Topic display name (H2 heading)")
+    if not heading:
+        print("Cancelled."); return
+    default_slug = slugify(heading)
+    slug = ask("Short slug for filename", default_slug)
+    desc = ask("One-line description")
+    ftype = ask("Type [project/feedback/reference/user]", "project").lower()
+    if ftype not in ("project", "feedback", "reference", "user"):
+        ftype = "project"
+    fname = f"{ftype}_{slug}.md"
+    fpath = MEM / fname
+    if fpath.exists():
+        print(f"✗ {fname} already exists."); return
+    fpath.write_text(f"""---
+name: {heading}
+description: {desc}
+type: {ftype}
+---
+
+# {heading}
+
+{desc if desc else '(Add initial context here.)'}
+
+## Current state
+
+-
+
+## Open questions / next
+
+-
+""")
+    with open(INDEX, "a") as f:
+        f.write(f"\n## {heading}\n- [{heading}]({fname}) — {desc}\n")
+    print(f"✓ Created {fpath.name} and appended H2 to MEMORY.md")
+    regen_dashboard()
+    print(f"✓ Dashboard.md refreshed")
+    if ask("Launch Claude with this topic? [Y/n]", "y").lower() in ("y", "yes"):
+        rows = build_rows()
+        for r in rows:
+            if r["title"] == heading:
+                launch(r); return
+
+# ---------- list ----------
+
+def cmd_list(rows):
+    print()
+    hdr = f"  {'Topic':<62} {'Msgs':>5}  {'Chars':>6}  {'Age':>8}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        kind_badge = "📁" if r["kind"] == "cluster" else "💬"
+        title = r["title"]
+        if len(title) > 60:
+            title = title[:59] + "…"
+        msgs = f"{r['msgs']:>4}" if r['msgs'] else "   ·"
+        chars = f"{human_chars(r['chars']):>5}" if r['chars'] else "    ·"
+        age = ago(r["last"])
+        meta = ""
+        if r["kind"] == "cluster":
+            if r["session_count"]:
+                meta = f"  ({len(r['files'])}f · {r['session_count']}s)"
+            else:
+                meta = f"  ({len(r['files'])}f)"
+        print(f"  {kind_badge} {title:<59} {msgs:>4}m  {chars:>5}c  {age:>8}{meta}")
+    print(f"\n  {len(rows)} topics · clusters first from MEMORY.md, then ad-hoc sessions\n")
+
+# ---------- main ----------
+
+def main():
+    args = sys.argv[1:]
+    dry = False
+    if args and args[0] == "--dry":
+        dry = True
+        args = args[1:]
+
+    if not INDEX.exists():
+        print(f"x MEMORY.md not found at {INDEX}")
+        print(f"  Looked under TOPIC_PROJECT={PROJECT_NAME}.")
+        print(f"  Create the file or set TOPIC_PROJECT to the right Claude Code project name.")
+        sys.exit(1)
+
+    if args and args[0] in ("help", "-h", "--help"):
+        print(__doc__); return
+
+    if args and args[0] == "new":
+        cmd_new(); return
+
+    if args and args[0] == "rescan":
+        build_session_index(force=True)
+        print("✓ Session cache rebuilt.")
+        return
+
+    rows = build_rows()
+
+    if args and args[0] == "list":
+        cmd_list(rows); return
+
+    if args and args[0] in ("dashboard", "refresh", "regen"):
+        regen_dashboard()
+        print(f"✓ Dashboard.md regenerated.")
+        return
+
+    if args and args[0] in ("graph", "obsidian"):
+        regen_dashboard()
+        subprocess.run(["open", "-a", "Obsidian", str(DASHBOARD)])
+        return
+
+    if not args:
+        regen_dashboard()
+        r, fallback_query = fzf_pick(rows)
+        if r:
+            launch(r, dry=dry)
+        elif fallback_query:
+            launch_search_history(fallback_query, dry=dry)
+        return
+
+    # fuzzy match (also scan entities across all sessions)
+    query = " ".join(args)
+    all_sessions = list(load_cache().get("sessions", {}).values())
+    r = fuzzy_match(rows, query, all_sessions=all_sessions)
+    if r:
+        regen_dashboard()
+        launch(r, dry=dry, query=query)
+    else:
+        # no direct match → search-history flow (Claude searches your full memory)
+        launch_search_history(query, dry=dry)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
