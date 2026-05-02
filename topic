@@ -17,6 +17,7 @@ is rebuilt from changed JSONLs on every invocation (fast, mtime-based).
   topic dashboard           regenerate Dashboard.md (Obsidian MOC)
   topic graph               regen + open Obsidian on Dashboard
   topic --dry <name>        preview launch prompt without launching
+  topic --spawn <name>      open in a new terminal window (current shell unaffected)
 
 Hidden: `topic rescan` force-clears cache (rarely needed; auto-refresh on
 every run picks up new/changed sessions already).
@@ -32,7 +33,7 @@ Configuration via environment variables:
                       extraction (your name, your company, recurring noise).
                       Example: TOPIC_STOP_NAMES="Jane,Acme,Loompa".
 """
-import os, re, sys, json, subprocess, shutil, time, hashlib
+import os, re, sys, json, subprocess, shutil, time, hashlib, shlex
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -442,7 +443,7 @@ Before responding to my first ask, do the following:
 3. Give me a tight 3–5 line status: what this topic is, what was most recently done, and what's pending. Then ask me what I want to work on.
 """
 
-def launch_search_history(query, dry=False):
+def launch_search_history(query, dry=False, spawn=False):
     """No direct topic match → launch Claude with a preamble that searches
     full history via claude-mem, loads relevant context, then offers next steps."""
     preamble = f"""Search topic: **{query}**
@@ -457,13 +458,35 @@ The topic router didn't find a direct match in my MEMORY.md clusters or recent s
 
 If nothing relevant turns up, say so in one line and we'll start fresh.
 """
+    if spawn:
+        cmd = f"{shlex.quote(CLAUDE_BIN)} {shlex.quote(preamble)}"
+        if dry:
+            print("--- launch preview (spawn search-history) ---")
+            print(cmd); print("---"); return
+        if spawn_in_new_window(cmd):
+            print(f"-> Opened new terminal window for search-history on '{query}'")
+        else:
+            print(f"-> Could not spawn new window. Run this manually:")
+            print(f"   {cmd}")
+        return
     if dry:
         print("--- launch preview (search-history fallback) ---")
         print(preamble); print("---"); return
     print(f"→ No direct match for '{query}' — launching Claude to search history via claude-mem...\n")
     os.execv(CLAUDE_BIN, [CLAUDE_BIN, preamble])
 
-def launch(row, dry=False, query=None):
+def launch(row, dry=False, query=None, spawn=False):
+    if spawn:
+        cmd = build_launch_cmd(row, query=query)
+        if dry:
+            print("--- launch preview (spawn new window) ---")
+            print(cmd); print("---"); return
+        if spawn_in_new_window(cmd):
+            print(f"-> Opened new terminal window: {row['title']}")
+        else:
+            print(f"-> Could not spawn new window. Run this manually:")
+            print(f"   {cmd}")
+        return
     # resume path: if we have a latest session id, --resume it; else start fresh with preamble
     sid = row.get("latest_session_id")
     if row["kind"] == "session" and sid:
@@ -500,6 +523,62 @@ def launch(row, dry=False, query=None):
         print(f"  Context files: {', '.join(row['files'])}")
     print("  Launching claude...\n")
     os.execv(CLAUDE_BIN, [CLAUDE_BIN, preamble])
+
+
+# ---------- spawn (new terminal window, current session stays) ----------
+
+def spawn_in_new_window(claude_cmd):
+    """Open a graphical terminal/pane with claude_cmd running.
+    Returns True if spawned, False if the caller must run it manually."""
+    if os.environ.get("TMUX"):
+        try:
+            subprocess.run(["tmux", "new-window", "sh", "-c", claude_cmd], check=True)
+            return True
+        except Exception:
+            pass
+    if (os.environ.get("WEZTERM_PANE") or os.environ.get("TERM_PROGRAM") == "WezTerm") and shutil.which("wezterm"):
+        try:
+            subprocess.run(["wezterm", "cli", "spawn", "--", "sh", "-c", claude_cmd], check=True)
+            return True
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        is_iterm = (
+            os.environ.get("LC_TERMINAL") == "iTerm2"
+            or os.environ.get("TERM_PROGRAM") == "iTerm.app"
+        )
+        cmd_literal = json.dumps(claude_cmd)
+        if is_iterm:
+            script = (
+                'tell application "iTerm"\n'
+                '  activate\n'
+                '  create window with default profile\n'
+                '  tell current session of current window\n'
+                f'    write text {cmd_literal}\n'
+                '  end tell\n'
+                'end tell'
+            )
+        else:
+            script = (
+                'tell application "Terminal"\n'
+                '  activate\n'
+                f'  do script {cmd_literal}\n'
+                'end tell'
+            )
+        try:
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            pass
+    return False
+
+def build_launch_cmd(row, query=None):
+    """Return a shell-runnable string that launches the right claude session."""
+    sid = row.get("latest_session_id")
+    if row["kind"] == "session" and sid:
+        return f"{shlex.quote(CLAUDE_BIN)} --resume {shlex.quote(sid)}"
+    preamble = build_preamble(row, query=query)
+    return f"{shlex.quote(CLAUDE_BIN)} {shlex.quote(preamble)}"
 
 # ---------- picker ----------
 
@@ -681,8 +760,10 @@ def cmd_list(rows):
 def main():
     args = sys.argv[1:]
     dry = False
-    if args and args[0] == "--dry":
-        dry = True
+    spawn = False
+    while args and args[0] in ("--dry", "--spawn"):
+        if args[0] == "--dry": dry = True
+        elif args[0] == "--spawn": spawn = True
         args = args[1:]
 
     if not INDEX.exists():
@@ -721,9 +802,9 @@ def main():
         regen_dashboard()
         r, fallback_query = fzf_pick(rows)
         if r:
-            launch(r, dry=dry)
+            launch(r, dry=dry, spawn=spawn)
         elif fallback_query:
-            launch_search_history(fallback_query, dry=dry)
+            launch_search_history(fallback_query, dry=dry, spawn=spawn)
         return
 
     # fuzzy match (also scan entities across all sessions)
@@ -732,10 +813,10 @@ def main():
     r = fuzzy_match(rows, query, all_sessions=all_sessions)
     if r:
         regen_dashboard()
-        launch(r, dry=dry, query=query)
+        launch(r, dry=dry, query=query, spawn=spawn)
     else:
         # no direct match → search-history flow (Claude searches your full memory)
-        launch_search_history(query, dry=dry)
+        launch_search_history(query, dry=dry, spawn=spawn)
 
 if __name__ == "__main__":
     try:

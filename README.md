@@ -9,6 +9,7 @@ Claude Code stores every session as a JSONL transcript and supports a per-projec
 ```
 topic                  picker sorted by recency, fzf to filter
 topic <keyword>        resume by topic name or person mentioned
+topic --spawn <kw>     resume in a NEW terminal window (current shell stays)
 topic new              interactive: create a new MEMORY.md cluster
 topic list             tree view of all topic clusters with activity
 topic dashboard        regenerate Dashboard.md (Obsidian MOC)
@@ -65,7 +66,25 @@ topic --help
 
 The first time you run `topic`, it builds an index from your existing JSONL sessions. After that, every invocation only re-scans changed files (mtime-based), so it stays fast.
 
-> **Heads up:** `topic` is a shell command, not a Claude Code slash command. Run it from your terminal (`topic`), or from inside Claude Code's prompt with the `!` prefix (`! topic`). There is no `/topic` slash command — slash commands can't launch a new `claude --resume` session, which is what `topic` needs to do.
+> **Note on slash commands:** `topic` is a shell command, not a Claude Code slash command (a slash command can't launch a new `claude --resume` session, which is what `topic` does). If you want a `/topic` shortcut inside Claude Code anyway, see the [Optional `/topic` slash command](#optional-topic-slash-command) section below.
+
+## Optional: `/topic` slash command
+
+If you use Claude Code, drop a tiny slash command into your config so `/topic` works inside any session:
+
+```bash
+mkdir -p ~/.claude/commands
+curl -fsSL https://raw.githubusercontent.com/RS-LA/topic-launcher/main/extras/topic.md -o ~/.claude/commands/topic.md
+```
+
+Then in any Claude Code session:
+
+- `/topic` — Claude runs `topic list` and shows you the cluster table, then asks which one you want to resume.
+- `/topic <keyword>` — Claude runs `topic --spawn <keyword>`, which opens the resumed session in a **new terminal window**. Your current Claude session stays alive.
+
+The slash command is just a thin shim around the shell command. It uses `topic --spawn`, which detects your terminal (macOS Terminal/iTerm via `osascript`, tmux via `tmux new-window`, WezTerm via `wezterm cli spawn`) and opens a new window or tab. If none of those work (Linux without a graphical detector, SSH session, etc.), it prints the launch command for you to copy and run manually.
+
+You can also call `topic --spawn <keyword>` directly from any shell to get the same new-window behavior without going through the slash command.
 
 ## Configuration
 
