@@ -38,21 +38,34 @@ If you use Claude Code daily across many topics, products, clients, side project
 
 ## Install
 
+**One-line install** (recommended):
+
 ```bash
-# 1. Drop the script in your PATH
+mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/RS-LA/topic-launcher/main/topic -o ~/bin/topic && chmod +x ~/bin/topic
+```
+
+Then make sure `~/bin` is on your `PATH`:
+
+```bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+source ~/.zshrc
+topic --help
+```
+
+**Manual install** (if you cloned the repo or prefer to inspect first):
+
+```bash
 mkdir -p ~/bin
 cp topic ~/bin/
 chmod +x ~/bin/topic
-
-# 2. Make sure ~/bin is in your shell's PATH
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
-
-# 3. Verify
 topic --help
 ```
 
 The first time you run `topic`, it builds an index from your existing JSONL sessions. After that, every invocation only re-scans changed files (mtime-based), so it stays fast.
+
+> **Heads up:** `topic` is a shell command, not a Claude Code slash command. Run it from your terminal (`topic`), or from inside Claude Code's prompt with the `!` prefix (`! topic`). There is no `/topic` slash command — slash commands can't launch a new `claude --resume` session, which is what `topic` needs to do.
 
 ## Configuration
 
